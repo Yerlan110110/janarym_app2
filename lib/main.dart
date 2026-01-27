@@ -1,23 +1,27 @@
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:permission_handler/permission_handler.dart';
 
-import 'live_router.dart';
-import 'yolo_client.dart';
+import 'core/assistant_engine.dart';
+import 'core/live_router.dart';
+import 'vision/frame_provider.dart';
+import 'vision/openai_vision.dart';
+import 'vision/yolo_client.dart';
 
 /// ======================
 /// Janarym MVP (Flutter)
 /// Live STT ("Жанарым ... команда") + OpenAI Vision + (опционально) YOLO server
 /// ======================
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: '.env');
   runApp(const JanarymApp());
 }
 
@@ -44,12 +48,7 @@ class JanarymHome extends StatefulWidget {
 
 class _JanarymHomeState extends State<JanarymHome> {
   // ====== CONFIG ======
-  // ⚠️ Не храни ключ в репо. Этот placeholder — ок для локального MVP.
-  static const String OPENAI_API_KEY = 'PASTE_YOUR_OPENAI_API_KEY_HERE';
-  static const String OPENAI_MODEL = 'gpt-4.1-mini';
-
-  /// YOLO сервер (FastAPI + Ultralytics). Если сервера нет — просто оставь пустым.
-  static const String YOLO_SERVER_URL = 'http://192.168.1.10:8000';
+  static const String _openAiModel = 'gpt-4.1-mini';
   // ====================
 
   final _picker = ImagePicker();
@@ -57,7 +56,8 @@ class _JanarymHomeState extends State<JanarymHome> {
   final _stt = stt.SpeechToText();
 
   final LiveRouter _router = LiveRouter();
-  late final YoloClient _yolo = YoloClient(YOLO_SERVER_URL);
+  final FrameProvider _frameProvider = FrameProvider();
+  late final AssistantEngine _engine;
 
   bool _listening = false; // микрофон слушает
   bool _busy = false; // выполняется действие (не слушаем/не принимаем)
@@ -73,7 +73,8 @@ class _JanarymHomeState extends State<JanarymHome> {
   void initState() {
     super.initState();
     _initTts();
-    _initPermissions();
+    _initEngine();
+    _initPermissions().then((_) => _initFrameProvider());
   }
 
   Future<void> _initPermissions() async {
@@ -91,11 +92,85 @@ class _JanarymHomeState extends State<JanarymHome> {
     await _tts.setPitch(1.0);
   }
 
+  void _initEngine() {
+    final apiKey = dotenv.get('OPENAI_API_KEY', fallback: '');
+    final yoloUrl = dotenv.get('YOLO_SERVER_URL', fallback: '').trim();
+
+    final visionClient = OpenAiVisionClient(
+      apiKey: apiKey,
+      model: _openAiModel,
+    );
+    final yoloClient = YoloClient(yoloUrl);
+    _engine = AssistantEngine(
+      visionClient: visionClient,
+      yoloClient: yoloClient,
+      speak: _speak,
+      getLatestFrameJpeg: _getLatestFrameJpeg,
+      capturePhotoJpegFallback: _capturePhotoJpegFallback,
+      setTtsVolume: _setTtsVolume,
+    );
+  }
+
+  Future<void> _initFrameProvider() async {
+    try {
+      await _frameProvider.init();
+      await _frameProvider.start();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'Camera init error: $e';
+      });
+    }
+  }
+
   Future<void> _speak(String text) async {
     final t = text.trim();
     if (t.isEmpty) return;
     await _tts.stop();
     await _tts.speak(t);
+  }
+
+  Future<void> _setTtsVolume(double volume) async {
+    await _tts.setVolume(volume);
+  }
+
+  Future<Uint8List?> _getLatestFrameJpeg() async {
+    return _frameProvider.latestJpeg;
+  }
+
+  Future<T> _withFramePause<T>(Future<T> Function() action) async {
+    final wasStreaming = _frameProvider.isStreaming;
+    if (wasStreaming) {
+      await _frameProvider.stop();
+    }
+    try {
+      return await action();
+    } finally {
+      if (wasStreaming) {
+        await _frameProvider.start();
+      }
+    }
+  }
+
+  Future<Uint8List?> _capturePhotoJpegFallback() async {
+    return _withFramePause(() async {
+      final file = await _picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+      );
+      if (file == null) return null;
+
+      final bytes = await File(file.path).readAsBytes();
+      if (!mounted) return bytes;
+
+      setState(() {
+        _image = file;
+        _result = '';
+        _status = 'Фото сделано. Нажми "Описать" или скажи "Жанарым, опиши".';
+      });
+
+      return bytes;
+    });
   }
 
   Future<void> _toggleListening() async {
@@ -141,7 +216,9 @@ class _JanarymHomeState extends State<JanarymHome> {
     // В live режиме не останавливаемся после результата.
     await _stt.listen(
       localeId: 'ru_RU',
-      listenMode: stt.ListenMode.confirmation,
+      listenOptions: stt.SpeechListenOptions(
+        listenMode: stt.ListenMode.confirmation,
+      ),
       onResult: (res) async {
         if (!_listening) return;
         if (_busy) return;
@@ -155,84 +232,46 @@ class _JanarymHomeState extends State<JanarymHome> {
         final cmd = _router.parse(text);
         if (cmd == null) return;
 
-        await _handleCommand(cmd);
+        setState(() {
+          _busy = true;
+          _status = 'Команда: ${cmd.intent}';
+        });
+
+        try {
+          if (cmd.intent == 'live_on') {
+            setState(() {
+              _liveMode = true;
+              _status = 'Live режим включён. Скажи "Жанарым ..."';
+            });
+            await _speak('Лайв режим включён.');
+          } else if (cmd.intent == 'live_off') {
+            setState(() {
+              _liveMode = false;
+              _status = 'Live режим выключен.';
+            });
+            await _speak('Лайв режим выключен.');
+          } else {
+            final result = await _engine.handleIntent(cmd.intent);
+            if (result != null && mounted) {
+              setState(() {
+                _result = result;
+              });
+            }
+          }
+        } finally {
+          if (mounted) {
+            setState(() {
+              _busy = false;
+              _status = _listening
+                  ? (_liveMode
+                        ? 'Live режим: слушаю. Скажи "Жанарым ..."'
+                        : 'Слушаю.')
+                  : 'Готов. Нажми "Голос".';
+            });
+          }
+        }
       },
     );
-  }
-
-  Future<void> _handleCommand(LiveCommand cmd) async {
-    // Чтобы не получать 2 раза один и тот же результат из STT,
-    // на время выполнения команды ставим busy.
-    setState(() {
-      _busy = true;
-      _status = 'Команда: ${cmd.intent}';
-    });
-
-    try {
-      switch (cmd.intent) {
-        case 'live_on':
-          setState(() {
-            _liveMode = true;
-            _status = 'Live режим включён. Скажи "Жанарым ..."';
-          });
-          await _speak('Лайв режим включён.');
-          break;
-
-        case 'live_off':
-          setState(() {
-            _liveMode = false;
-            _status = 'Live режим выключен.';
-          });
-          await _speak('Лайв режим выключен.');
-          break;
-
-        case 'repeat':
-          await _speak(_result.isEmpty ? 'Пока нечего повторять.' : _result);
-          break;
-
-        case 'tts_louder':
-          await _tts.setVolume(1.0);
-          await _speak('Громче.');
-          break;
-
-        case 'tts_quieter':
-          await _tts.setVolume(0.5);
-          await _speak('Тише.');
-          break;
-
-        // ===== Vision intents =====
-        case 'vision_describe':
-          await _voiceDescribeWithOpenAI();
-          break;
-
-        case 'vision_ahead':
-          await _voiceYoloDirection('впереди');
-          break;
-        case 'vision_left':
-          await _voiceYoloDirection('слева');
-          break;
-        case 'vision_right':
-          await _voiceYoloDirection('справа');
-          break;
-        case 'vision_behind':
-          await _voiceYoloDirection('сзади');
-          break;
-
-        case 'unknown':
-        default:
-          await _speak('Команда не распознана. Скажи: "Жанарым, что впереди".');
-          break;
-      }
-    } finally {
-      setState(() {
-        _busy = false;
-        _status = _listening
-            ? (_liveMode
-                  ? 'Live режим: слушаю. Скажи "Жанарым ..."'
-                  : 'Слушаю.')
-            : 'Готов. Нажми "Голос".';
-      });
-    }
   }
 
   // ========= Manual buttons (gallery/camera) =========
@@ -255,10 +294,12 @@ class _JanarymHomeState extends State<JanarymHome> {
 
   Future<void> _takePhoto() async {
     if (_busy) return;
-    final file = await _picker.pickImage(
-      source: ImageSource.camera,
-      imageQuality: 85,
-    );
+    final file = await _withFramePause(() async {
+      return _picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+      );
+    });
     if (file == null) return;
 
     setState(() {
@@ -269,18 +310,19 @@ class _JanarymHomeState extends State<JanarymHome> {
     await _speak('Фото сделано. Нажми описать.');
   }
 
-  // ========= Voice-triggered actions =========
+  // ========= Manual actions =========
 
-  /// Голосом: "Жанарым, опиши" — если фото нет, делаем снимок и отправляем в OpenAI Vision.
-  Future<void> _voiceDescribeWithOpenAI() async {
+  Future<void> _describeSelectedImage() async {
+    if (_busy) return;
     await _speak('Окей. Сделаю снимок и опишу.');
 
-    // Если фото не выбрано — снимаем.
     XFile? img = _image;
-    img ??= await _picker.pickImage(
-      source: ImageSource.camera,
-      imageQuality: 85,
-    );
+    img ??= await _withFramePause(() async {
+      return _picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+      );
+    });
     if (img == null) {
       await _speak('Не получилось сделать фото.');
       return;
@@ -293,94 +335,16 @@ class _JanarymHomeState extends State<JanarymHome> {
     });
 
     final bytes = await File(img.path).readAsBytes();
-    final base64Image = base64Encode(bytes);
+    final text = await _engine.describeJpegBytes(bytes, detailed: false);
 
-    final prompt = _buildJanarymPrompt();
-    final text = await _callOpenAIResponsesVision(
-      apiKey: OPENAI_API_KEY,
-      model: OPENAI_MODEL,
-      base64Image: base64Image,
-      prompt: prompt,
-    );
-
+    if (!mounted) return;
     setState(() {
       _result = text;
       _status = 'Готово.';
     });
-    await _speak(text);
-  }
-
-  /// Голосом: "Жанарым, что впереди/слева/справа/сзади"
-  /// MVP: делаем один снимок камерой -> отправляем на YOLO сервер -> короткая озвучка объектов.
-  Future<void> _voiceYoloDirection(String directionRu) async {
-    if (YOLO_SERVER_URL.trim().isEmpty) {
-      await _speak('YOLO сервер не настроен.');
-      return;
-    }
-
-    await _speak('Секунду. Смотрю $directionRu.');
-
-    final img = await _picker.pickImage(
-      source: ImageSource.camera,
-      imageQuality: 80,
-    );
-    if (img == null) {
-      await _speak('Не получилось сделать фото.');
-      return;
-    }
-
-    setState(() {
-      _image = img;
-      _result = '';
-      _status = 'YOLO анализ: $directionRu...';
-    });
-
-    final bytes = await File(img.path).readAsBytes();
-    final detections = await _yolo.detectJpeg(bytes);
-
-    if (detections.isEmpty) {
-      final text = 'Я не вижу объектов $directionRu.';
-      setState(() => _result = text);
-      await _speak(text);
-      return;
-    }
-
-    // Берём топ объектов по уверенности
-    detections.sort((a, b) => b.conf.compareTo(a.conf));
-    final top = detections.take(6).where((d) => d.conf >= 0.35).toList();
-
-    final labels = <String>[];
-    for (final d in top) {
-      labels.add(d.label);
-    }
-
-    final summary = labels.isEmpty
-        ? 'Я не уверен, что там есть объекты.'
-        : 'С $directionRu я вижу: ${labels.toSet().join(', ')}.';
-
-    setState(() => _result = summary);
-    await _speak(summary);
   }
 
   // ========= Utilities =========
-
-  String _buildJanarymPrompt() {
-    return '''
-Ты — Janarym, ассистент для незрячего пользователя.
-Опиши изображение так, чтобы человек мог понять ситуацию и действовать.
-
-Правила:
-1) Начни с 1–2 предложений "что в целом происходит".
-2) Затем списком: главные объекты, их расположение (слева/справа/по центру/вдалеке).
-3) Если виден текст — перепиши текст точно.
-4) Если есть потенциальные риски (ступеньки, машины, огонь, острые предметы) — скажи явно.
-5) Если это документ/меню/упаковка — выдели ключевые поля/цены/состав/срок.
-6) Заверши 1–2 уточняющими вопросами.
-
-Тон: спокойный, конкретный, без воды.
-Язык: русский.
-''';
-  }
 
   Future<void> _clear() async {
     if (_busy) return;
@@ -391,6 +355,14 @@ class _JanarymHomeState extends State<JanarymHome> {
       _status = 'Готов. Нажми "Голос" и скажи "Жанарым ..."';
     });
     await _speak('Очищено. Готов к работе.');
+  }
+
+  @override
+  void dispose() {
+    _stt.stop();
+    _tts.stop();
+    _frameProvider.dispose();
+    super.dispose();
   }
 
   @override
@@ -489,7 +461,7 @@ class _JanarymHomeState extends State<JanarymHome> {
                     child: _BigButton(
                       icon: Icons.visibility_outlined,
                       text: 'Описать',
-                      onPressed: _voiceDescribeWithOpenAI,
+                      onPressed: _describeSelectedImage,
                       enabled: !_busy,
                       semanticLabel: 'Описать изображение через OpenAI',
                     ),
@@ -622,76 +594,4 @@ class _BigButton extends StatelessWidget {
       ),
     );
   }
-}
-
-/// ======================
-/// OpenAI call (Responses API) with base64 image
-/// ======================
-Future<String> _callOpenAIResponsesVision({
-  required String apiKey,
-  required String model,
-  required String base64Image,
-  required String prompt,
-}) async {
-  if (apiKey.isEmpty || apiKey.contains('PASTE_YOUR')) {
-    throw Exception('OPENAI_API_KEY не задан');
-  }
-
-  final uri = Uri.parse('https://api.openai.com/v1/responses');
-
-  final body = {
-    "model": model,
-    "input": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "input_text", "text": prompt},
-          {
-            "type": "input_image",
-            "image_url": "data:image/jpeg;base64,$base64Image",
-          },
-        ],
-      },
-    ],
-    "max_output_tokens": 450,
-  };
-
-  final res = await http.post(
-    uri,
-    headers: {
-      HttpHeaders.authorizationHeader: 'Bearer $apiKey',
-      HttpHeaders.contentTypeHeader: 'application/json',
-    },
-    body: jsonEncode(body),
-  );
-
-  if (res.statusCode < 200 || res.statusCode >= 300) {
-    throw Exception('OpenAI HTTP ${res.statusCode}: ${res.body}');
-  }
-
-  final decoded = jsonDecode(res.body);
-
-  final outputText = decoded["output_text"];
-  if (outputText is String && outputText.trim().isNotEmpty) {
-    return outputText.trim();
-  }
-
-  final output = decoded["output"];
-  if (output is List) {
-    final buffer = StringBuffer();
-    for (final item in output) {
-      final content = item["content"];
-      if (content is List) {
-        for (final c in content) {
-          if (c["type"] == "output_text" && c["text"] is String) {
-            buffer.writeln(c["text"]);
-          }
-        }
-      }
-    }
-    final t = buffer.toString().trim();
-    if (t.isNotEmpty) return t;
-  }
-
-  return 'Не удалось извлечь текст ответа.';
 }
