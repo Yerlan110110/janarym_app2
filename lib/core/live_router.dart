@@ -11,22 +11,92 @@ class LiveRouter {
   static const _wakeWordsRaw = [
     'жанарым',
     'жанарам',
+    'жанарим',
+    'жанаром',
+    'жанарымь',
+    'жанарымм',
+    'жанарымн',
+    'жанарымр',
+    'жанарем',
+    'жанарям',
+    'жанерым',
+    'жанурым',
+    'жанарум',
+    'жанырым',
+    'жанирым',
+    'жанерим',
+    'жанар',
     'жанрам',
-    'джанарым',
-    'шмарым',
+    'жанрым',
     'жаным',
+    'жанымм',
+    'жаным а',
+    'жаным э',
+    'жанам',
+    'жанамы',
+    'жанам а',
+    'жанам э',
+    'джанарым',
+    'джанарам',
+    'джанарим',
+    'джанаром',
+    'джаным',
+    'занарым',
+    'занарам',
+    'занарим',
+    'занаром',
+    'заным',
+    'шанарым',
+    'шанарам',
+    'шанарим',
+    'шанаром',
+    'шаным',
+    'шмарым',
+    'шмары',
+    'жмарым',
+    'жмары',
+    'жнарым',
     'janarym',
+    'janarim',
+    'janaram',
+    'janarum',
+    'janerim',
     'zhanarym',
+    'zhanarim',
+    'zhanaram',
+    'zhanarum',
+    'zhanerim',
+    'djanarym',
+    'djanarim',
+    'djanaram',
+    'jannarym',
+    'jannary',
+    'жанарым да',
+    'жанарым ғой',
+    'жанарым эй',
+    'жанарым ой',
+    'жанарым ау',
+    'жанарым аа',
+    'жанарым мм',
+    'жанарым хм',
+    'жанарым эээ',
+    'жанарым йа',
+    'жанрм',
+    'жанм',
+    'жарым',
+    'дарым',
+    'нарым',
+    'анарым',
+    'янарым',
+    'енарым',
+    'инарым',
+    'онарым',
   ];
 
   static const _shortWords = ['короче', 'кратко', 'коротко'];
   static const _detailedWords = ['подробнее', 'подробней', 'детальнее'];
 
-  static const _liveOnWords = [
-    'включи лайв',
-    'live режим',
-    'режим лайв',
-  ];
+  static const _liveOnWords = ['включи лайв', 'live режим', 'режим лайв'];
   static const _liveOffWords = ['выключи лайв', 'stop', 'стоп'];
   static const _repeatWords = ['повтори'];
   static const _louderWords = ['громче'];
@@ -77,7 +147,9 @@ class LiveRouter {
     final direction = _detectDirection(cmd);
 
     final onlyVerbosity =
-        direction == null && verbosity != _Verbosity.normal && _isOnlyVerbosity(cmd, verbosity);
+        direction == null &&
+        verbosity != _Verbosity.normal &&
+        _isOnlyVerbosity(cmd, verbosity);
 
     if (onlyVerbosity && verbosity == _Verbosity.short) {
       return LiveCommand(text, 'summarize_short');
@@ -129,7 +201,9 @@ class LiveRouter {
         .where((w) => w.isNotEmpty)
         .toList();
 
-    final verbWords = verbosity == _Verbosity.short ? _shortWords : _detailedWords;
+    final verbWords = verbosity == _Verbosity.short
+        ? _shortWords
+        : _detailedWords;
     final remaining = words
         .where((w) => !_stopWords.contains(w) && !verbWords.contains(w))
         .toList();

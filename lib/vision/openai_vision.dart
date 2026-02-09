@@ -8,19 +8,25 @@ class OpenAiVisionClient {
   final String model;
   final http.Client _http;
 
+  static const String _missingApiKeyMessage = 'OpenAI API key is required.';
+
   OpenAiVisionClient({
     required this.apiKey,
     required this.model,
     http.Client? httpClient,
-  }) : _http = httpClient ?? http.Client();
+  }) : _http = httpClient ?? http.Client() {
+    if (apiKey.trim().isEmpty) {
+      throw StateError(_missingApiKeyMessage);
+    }
+  }
 
   Future<String> describeBase64Jpeg({
     required String base64Image,
     required String prompt,
     int maxOutputTokens = 450,
   }) async {
-    if (apiKey.isEmpty || apiKey.contains('PASTE_YOUR')) {
-      throw Exception('OPENAI_API_KEY не задан');
+    if (apiKey.trim().isEmpty) {
+      throw StateError(_missingApiKeyMessage);
     }
 
     final uri = Uri.parse('https://api.openai.com/v1/responses');

@@ -1,16 +1,16 @@
 # janarym_app2
 
-A new Flutter project.
+## Setup Android
 
-## Getting Started
+- Install Android SDK Platform 36 (`platforms;android-36`) and build-tools.
+- Use JDK 17.
+- Run `flutter doctor` and ensure Android toolchain is green.
 
-This project is a starting point for a Flutter application.
+## Setup .env
 
-A few resources to get you started if this is your first Flutter project:
-
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+- Copy `.env.example` to `.env`.
+- Fill `OPENAI_API_KEY` (required) and `YOLO_SERVER_URL` (optional).
+- Run with the env file passed at build time:
+  `flutter run --dart-define-from-file=.env`
+- If `.env` is missing or the key is empty, the app will show:
+  "Нет .env, добавь OPENAI_API_KEY".
